@@ -1144,27 +1144,6 @@ body {
 }
     </style>
 <style>
-/* AI options – clear ON/OFF state */
-.nal-ai-pill {
-  transition: transform .12s ease, opacity .12s ease, filter .12s ease;
-}
-
-.nal-ai-pill:not(.nal-ai-pillOn) {
-  opacity: .55;
-  filter: grayscale(0.25);
-}
-
-.nal-ai-pill.nal-ai-pillOn {
-  opacity: 1;
-  transform: translateY(-1px);
-  box-shadow: 0 0 0 1px rgba(168, 85, 247, .35), 0 8px 18px rgba(168, 85, 247, .12);
-}
-
-/* Optional: hover feedback */
-.nal-ai-pill:hover {
-  opacity: .95;
-}
-
 
 /* ===== Auth FAB + Modal ===== */
 #authFab{
@@ -1484,18 +1463,18 @@ body {
     </div>
 
     <script>
-    // 1️⃣ NAL LADDERS (GLOBAL)
-// Server is the single source of truth.
-// This dashboard hydrates window.ladders AFTER apiFetch() is available.
-window.ladders = null;
-window.__NAL_STATE__ = null;
-// temporary stub (will be replaced below once apiFetch exists)
-window.refreshNAL = async function(){ 
-  console.warn("[NAL] refreshNAL called before apiFetch is ready"); 
-  return null; 
-};
-
-// App State (persistent + daily counters)
+    // 1️⃣ LOAD LADDERS INTO MEMORY (GLOBAL)
+(function loadLaddersIntoWindow(){
+try{
+const raw = localStorage.getItem("nal_ladders_v1");
+if (!raw) return;
+window.ladders = JSON.parse(raw);
+console.log("[NAL] ladders loaded:", Object.keys(window.ladders));
+} catch(e){
+console.warn("[NAL] failed to load ladders:", e);
+}
+})();
+            // App State (persistent + daily counters)
 const state = {
   // persistent (NIE resetują się dziennie)
   currentXP: 0,
@@ -1555,46 +1534,15 @@ async function apiFetch(path, opts = {}){
   return json;
 }
 
-// ---- NAL bootstrap (server-only) ----
-window.refreshNAL = async function refreshNAL(){
-  const token = getAuthToken();
-  if(!token){
-    window.__NAL_STATE__ = null;
-    window.ladders = null;
-    console.log("[NAL] not logged in -> ladders unavailable");
-    return null;
-  }
-  try{
-    const state = await apiFetch("/api/state", { method: "GET" });
-    window.__NAL_STATE__ = state || {};
-    window.ladders = (state && state.nal && state.nal.ladders) ? state.nal.ladders : null;
-    console.log("[NAL] ladders hydrated from server:", window.ladders ? Object.keys(window.ladders) : null);
-    return window.ladders;
-  } catch(e){
-    console.warn("[NAL] failed to hydrate ladders from server:", e);
-    window.__NAL_STATE__ = null;
-    window.ladders = null;
-    return null;
-  }
-};
-
-// hydrate once on load (non-blocking)
-setTimeout(() => { window.refreshNAL?.(); }, 0);
-
-
 // Auth helpers (multi-user)
 async function apiRegister(email, password){
   const out = await apiFetch("/api/auth/register", { method:"POST", body: JSON.stringify({ email, password }) });
   if (out && out.token) setAuthToken(out.token);
-  // hydrate ladders for AI + other modules immediately after auth
-  try { await window.refreshNAL?.(); } catch {}
   return out;
 }
 async function apiLogin(email, password){
   const out = await apiFetch("/api/auth/login", { method:"POST", body: JSON.stringify({ email, password }) });
   if (out && out.token) setAuthToken(out.token);
-  // hydrate ladders for AI + other modules immediately after auth
-  try { await window.refreshNAL?.(); } catch {}
   return out;
 }
 function apiLogout(){
@@ -3300,6 +3248,569 @@ btn.addEventListener("click", (e) => {
   </div>
 </div>
 
+<script>
+/* =========================
+   NAL AI — SERVER BACKEND VERSION (READY DROP-IN)
+   - Uses backend endpoint: /api/ai/suggest
+   - Sends JWT from localStorage auth_token
+   - Logs ladder slice + counts to console
+   - Options pills are clickable (requires #nalAiOptions buttons)
+========================= */
+
+(function(){
+  if (window.__NAL_AI_INSTALLED__) return;
+  window.__NAL_AI_INSTALLED__ = true;
+
+  const NAL_AI = {
+    endpoint: "/api/ai/suggest",
+    suggestionsCount: 5,
+    timeoutMs: 20000,
+    maxLevels: 6,
+    maxTasksPerLevel: 50,
+    maxCurrentMissions: 25,
+  };
+
+  const els = {
+    overlay: () => document.getElementById("nalAiOverlay"),
+    closeBtn: () => document.getElementById("nalAiCloseBtn"),
+    cancelBtn: () => document.getElementById("nalAiCancelBtn"),
+    regenBtn: () => document.getElementById("nalAiRegenBtn"),
+    applyBtn: () => document.getElementById("nalAiApplyBtn"),
+    suggestionsWrap: () => document.getElementById("nalAiSuggestions"),
+    categoryLabel: () => document.getElementById("nalAiCategoryLabel"),
+    subtitle: () => document.getElementById("nalAiSubtitle"),
+    hint: () => document.getElementById("nalAiHint"),
+    modeSeg: () => document.getElementById("nalAiMode"),
+    optionsBox: () => document.getElementById("nalAiOptions"),
+  };
+
+  const aiState = {
+    categoryId: null,
+    aiMode: "focused",
+    lastResult: null,
+    selectedSuggestionIds: new Set(),
+    loading: false,
+    options: {
+      avoidDuplicates: true,
+      useLadderProgress: true,
+      maxTasks: 5
+    }
+  };
+
+  // ---------- helpers ----------
+  const escapeHtml = (str) => (str ?? "").toString()
+    .replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;")
+    .replaceAll('"',"&quot;").replaceAll("'","&#039;");
+
+  const uniqStrings = (arr) => {
+    const out = [];
+    const seen = new Set();
+    for (const v of (arr || [])) {
+      const s = (v ?? "").toString().trim();
+      if (!s) continue;
+      const k = s.toLowerCase();
+      if (seen.has(k)) continue;
+      seen.add(k);
+      out.push(s);
+    }
+    return out;
+  };
+
+  const todayISO = () => new Date().toISOString().slice(0,10);
+
+  function getAuthToken(){
+    return localStorage.getItem("auth_token") || "";
+  }
+
+  function setHint(msg){
+    const h = els.hint();
+    if (h) h.textContent = msg || "";
+  }
+
+  function setApplyEnabled(enabled){
+    const btn = els.applyBtn();
+    if (!btn) return;
+    if (enabled){
+      btn.classList.remove("nal-ai-disabled");
+      btn.removeAttribute("title");
+    } else {
+      btn.classList.add("nal-ai-disabled");
+      btn.setAttribute("title","Select at least 1 suggestion");
+    }
+  }
+
+  function getApplyMode(){
+    const r = document.querySelector('input[name="nalAiApplyMode"]:checked');
+    return r ? r.value : "replace";
+  }
+
+  function getCategoryName(categoryId){
+    try{
+      const c = (window.categories || []).find(x => x.id === categoryId);
+      return c?.name || categoryId;
+    } catch { return categoryId; }
+  }
+
+  function getCurrentMissionsText(categoryId){
+    try{
+      const missions = window.getMissionsForCategory ? (window.getMissionsForCategory(categoryId) || []) : [];
+      const texts = missions.map(m => typeof m === "string" ? m : (m?.title ?? m?.text ?? ""));
+      return uniqStrings(texts).slice(0, NAL_AI.maxCurrentMissions);
+    } catch { return []; }
+  }
+
+  function getLadderSlice(categoryId){
+    const ladders = window.ladders;
+    if (!ladders) return null;
+
+    const cat =
+      ladders[categoryId] ||
+      ladders[categoryId?.toLowerCase?.()] ||
+      ladders[categoryId?.toUpperCase?.()];
+
+    if (!cat || !cat.levels) return null;
+
+    const isArray = Array.isArray(cat.levels);
+
+    const levelsOut = [];
+    for (let i = 0; i < NAL_AI.maxLevels; i++){
+      const bucket = isArray ? cat.levels[i] : cat.levels[String(i)];
+      const arr = Array.isArray(bucket) ? bucket : [];
+
+      const tasks = arr
+        .slice(0, NAL_AI.maxTasksPerLevel)
+        .map(t => ({
+          id: t?.id ?? null,
+          text: t?.text ?? "",
+          completed: !!t?.completed
+        }))
+        .filter(t => (t.text || "").trim().length > 0);
+
+      levelsOut.push({ levelIndex: i, tasks });
+    }
+
+    return { categoryId, levels: levelsOut };
+  }
+
+  function getPastCompleted(categoryId){
+    try{
+      const raw = localStorage.getItem("nal_ai_past_completed_v1");
+      if (!raw) return [];
+      const obj = JSON.parse(raw);
+      const arr = obj?.[categoryId] || obj?.[categoryId?.toLowerCase?.()] || [];
+      return uniqStrings(arr).slice(0, 200);
+    } catch { return []; }
+  }
+
+  function debugLogLadder(categoryId){
+    const slice = getLadderSlice(categoryId);
+    const hasLadder = !!(slice && slice.levels && slice.levels.some(l => (l.tasks || []).length));
+    const incompleteCount = hasLadder
+      ? slice.levels.flatMap(l => l.tasks || []).filter(t => !t.completed).length
+      : 0;
+
+    console.log("[AI] ladder slice:", slice);
+    console.log("[AI] has ladder tasks:", hasLadder, "| incomplete:", incompleteCount);
+
+    return { slice, hasLadder, incompleteCount };
+  }
+
+  function confBadgeClass(conf){
+    return (conf === "high") ? "nal-ai-badgeGood" : "nal-ai-badgeHi";
+  }
+
+  // ---------- modal open/close ----------
+  function openOverlay(){
+    const overlay = els.overlay();
+    if (!overlay) return;
+    overlay.classList.add("nal-ai-open");
+    document.body.style.overflow = "hidden";
+  }
+
+  function closeOverlay(){
+    const overlay = els.overlay();
+    if (!overlay) return;
+    overlay.classList.remove("nal-ai-open");
+    document.body.style.overflow = "";
+  }
+
+  function setHeader(categoryId){
+    const label = els.categoryLabel();
+    const sub = els.subtitle();
+    const nice = getCategoryName(categoryId);
+    if (label) label.textContent = nice;
+    if (sub) sub.textContent = `Source: Mastery Ladder (${nice}) · ${todayISO()}`;
+  }
+
+  // ---------- rendering ----------
+  function renderSkeleton(){
+    const wrap = els.suggestionsWrap();
+    if (!wrap) return;
+    wrap.innerHTML = `
+      <div class="nal-ai-card"><div class="nal-ai-main">
+        <div class="nal-ai-cardTitle">Loading…</div>
+        <div class="nal-ai-why">Generating suggestions…</div>
+      </div></div>
+    `;
+    setApplyEnabled(false);
+  }
+
+  function renderSuggestions(items){
+    const wrap = els.suggestionsWrap();
+    if (!wrap) return;
+
+    aiState.selectedSuggestionIds.clear();
+    wrap.innerHTML = "";
+
+    items.forEach((s, idx) => {
+      const id = s.id || `s_${idx}_${Math.random().toString(16).slice(2)}`;
+
+      const el = document.createElement("div");
+      el.className = "nal-ai-card";
+      el.innerHTML = `
+        <label class="nal-ai-check" title="Select">
+          <input type="checkbox" data-sid="${escapeHtml(id)}">
+          <span></span>
+        </label>
+        <div class="nal-ai-main">
+          <div class="nal-ai-cardTitle">${escapeHtml(s.title || "Task")}</div>
+          <div class="nal-ai-meta">
+            <span class="nal-ai-badge nal-ai-badgeHi">${escapeHtml(s.tag || "Suggestion")}</span>
+            <span class="nal-ai-badge">⏱ ${escapeHtml(s.time || "")}</span>
+            <span class="nal-ai-badge">⭐ ${escapeHtml(s.xp || "")}</span>
+            <span class="nal-ai-badge ${confBadgeClass(s.conf)}">🟢 Confidence: ${escapeHtml(s.conf || "medium")}</span>
+          </div>
+          <div class="nal-ai-why">Why: ${escapeHtml(s.why || "")}</div>
+        </div>
+      `;
+      wrap.appendChild(el);
+    });
+
+    setApplyEnabled(false);
+
+    wrap.onchange = () => {
+      const checks = [...wrap.querySelectorAll('input[type="checkbox"][data-sid]:checked')];
+      aiState.selectedSuggestionIds = new Set(checks.map(c => c.dataset.sid));
+      setApplyEnabled(checks.length > 0);
+    };
+  }
+
+  // ---------- Options (clickable) ----------
+  function syncOptionsUI(){
+    const box = els.optionsBox();
+    if (!box) return;
+
+    const btnDup = box.querySelector('[data-opt="avoidDuplicates"]');
+    const btnProg = box.querySelector('[data-opt="useLadderProgress"]');
+    const btnMax = box.querySelector('[data-opt="maxTasks"]');
+
+    if (btnDup) btnDup.classList.toggle("nal-ai-pillOn", !!aiState.options.avoidDuplicates);
+    if (btnProg) btnProg.classList.toggle("nal-ai-pillOn", !!aiState.options.useLadderProgress);
+
+    if (btnMax) {
+      btnMax.classList.add("nal-ai-pillOn");
+      btnMax.textContent = `🧩 Max ${aiState.options.maxTasks} tasks`;
+    }
+  }
+
+  els.optionsBox()?.addEventListener("click", (e) => {
+    const b = e.target.closest("button[data-opt]");
+    if (!b) return;
+
+    const opt = b.dataset.opt;
+
+    if (opt === "avoidDuplicates") aiState.options.avoidDuplicates = !aiState.options.avoidDuplicates;
+    if (opt === "useLadderProgress") aiState.options.useLadderProgress = !aiState.options.useLadderProgress;
+
+    if (opt === "maxTasks") {
+      const curr = aiState.options.maxTasks || 5;
+      aiState.options.maxTasks = (curr === 3) ? 5 : (curr === 5) ? 8 : 3;
+      NAL_AI.suggestionsCount = aiState.options.maxTasks;
+    }
+
+    syncOptionsUI();
+    if (aiState.categoryId && !aiState.loading) loadSuggestions(aiState.categoryId);
+  });
+
+  // ---------- API call (BACKEND) ----------
+  async function callAi(categoryId){
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), NAL_AI.timeoutMs);
+
+    try{
+      const token = getAuthToken();
+      if (!token) throw new Error("Not logged in (missing auth_token)");
+
+      const { slice, hasLadder, incompleteCount } = debugLogLadder(categoryId);
+
+      const payload = {
+        categoryId,
+        categoryName: getCategoryName(categoryId),
+        aiMode: aiState.aiMode,
+        options: { ...aiState.options },
+        today: todayISO(),
+        ladder: slice,
+        currentDashboardTasks: getCurrentMissionsText(categoryId),
+        pastCompletedTasks: getPastCompleted(categoryId),
+        debug: { hasLadder, incompleteCount }
+      };
+
+      console.log("[AI] calling backend:", NAL_AI.endpoint, payload);
+
+      const res = await fetch(NAL_AI.endpoint, {
+        method: "POST",
+        headers: {
+          "Content-Type":"application/json",
+          "Authorization": "Bearer " + token
+        },
+        body: JSON.stringify(payload),
+        signal: controller.signal
+      });
+
+      const rawText = await res.text();
+      console.log("[AI] backend HTTP status:", res.status);
+      console.log("[AI] backend raw (first 500):", rawText.slice(0, 500));
+
+      if (!res.ok){
+        throw new Error(`Backend AI HTTP ${res.status}: ${rawText.slice(0, 200)}`);
+      }
+
+      const data = JSON.parse(rawText);
+      const suggestions = data?.suggestions || data?.result?.suggestions || [];
+      return { suggestions };
+
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  // ---------- normalize + fallback ----------
+  function normalizeResult(raw){
+    const suggestions = Array.isArray(raw?.suggestions) ? raw.suggestions : [];
+
+    // tolerate different schemas from backend
+    const cleaned = suggestions.map((s,i) => ({
+      id: s.id || `s_${i}`,
+      title: (s.title ?? s.task ?? s.name ?? "").toString().trim(),
+      why: (s.why ?? s.description ?? "").toString().trim(),
+      tag: (s.tag ?? "AI").toString().trim(),
+      time: (s.time ?? (s.durationMin ? `${s.durationMin}m` : "") ?? "").toString().trim(),
+      xp: (s.xp ?? (s.points ?? "") ?? "").toString().trim(),
+      conf: (s.conf ?? "medium").toString().trim(),
+    })).filter(x => x.title);
+
+    return { suggestions: cleaned.slice(0, NAL_AI.suggestionsCount) };
+  }
+
+  function fallbackFromCurrent(categoryId){
+    const current = getCurrentMissionsText(categoryId);
+    const pick = current.slice(0, NAL_AI.suggestionsCount).map((t,i)=>({
+      id: `fb_${i}`,
+      title: t,
+      why: "Fallback (no AI).",
+      tag: "Fallback",
+      time: "",
+      xp: "",
+      conf: "medium",
+    }));
+    return { suggestions: pick.length ? pick : [{
+      id:"fb_0", title:"Pick the next incomplete ladder task", why:"Fallback.", tag:"Fallback", time:"", xp:"", conf:"medium"
+    }]};
+  }
+
+  async function loadSuggestions(categoryId){
+    aiState.loading = true;
+    renderSkeleton();
+    setHint("Generating…");
+
+    try{
+      const raw = await callAi(categoryId);
+      const result = normalizeResult(raw);
+
+      // duplicates vs current missions (optional)
+      const currentMissions = (() => {
+        try {
+          const raw = window.getMissionsForCategory
+            ? (window.getMissionsForCategory(categoryId) || [])
+            : [];
+          return raw
+            .map(m => typeof m === "string" ? m : (m?.title ?? m?.text ?? ""))
+            .map(t => t.toLowerCase().trim())
+            .filter(Boolean);
+        } catch {
+          return [];
+        }
+      })();
+
+      const currentSet = new Set(currentMissions);
+
+      if (aiState.options.avoidDuplicates) {
+        result.suggestions = result.suggestions.filter(
+          s => !currentSet.has((s.title || "").toLowerCase().trim())
+        );
+      }
+
+      if (!result.suggestions.length) {
+        const info = {
+          suggestions: [{
+            id: "none_0",
+            title: "No fresh suggestions (duplicates filtered)",
+            why: "AI generated tasks that already exist. Try Regenerate, switch AI mode, or disable duplicate filtering.",
+            tag: "Info",
+            time: "",
+            xp: "",
+            conf: "medium",
+          }]
+        };
+
+        aiState.lastResult = info;
+        renderSuggestions(info.suggestions);
+        setHint("No new suggestions · try Regenerate or switch mode");
+        return;
+      }
+
+      aiState.lastResult = result;
+      renderSuggestions(result.suggestions);
+      setHint("Ready · Select what you want to apply");
+
+    } catch (err){
+      console.error(err);
+      const fb = fallbackFromCurrent(categoryId);
+      aiState.lastResult = fb;
+      renderSuggestions(fb.suggestions);
+      setHint("AI error — showing fallback.");
+    } finally {
+      aiState.loading = false;
+    }
+  }
+
+  // ---------- Apply into dashboard missions ----------
+  function applySuggestionsToDashboard(categoryId){
+    const result = aiState.lastResult;
+    if (!result?.suggestions?.length) return;
+
+    const mode = getApplyMode();
+    const catId = categoryId || aiState.categoryId;
+    if (!catId) return;
+
+    const selected = result.suggestions.filter(s => aiState.selectedSuggestionIds.has(s.id));
+    if (!selected.length) return;
+
+    const selectedObjects = selected.map(s => ({
+      title: (s.title ?? "").toString().trim(),
+      description: (s.why ?? "").toString().trim(),
+      duration: (s.time ?? "").toString().trim(),
+      xp: (s.xp ?? "").toString().trim(),
+    })).filter(m => m.title);
+
+    let current = [];
+    try {
+      const raw = window.getMissionsForCategory ? (window.getMissionsForCategory(catId) || []) : [];
+      current = raw.map(m => {
+        if (typeof m === "string") return { title: m, description:"", duration:"", xp:"" };
+        return {
+          title: (m.title ?? m.text ?? "").toString().trim(),
+          description: (m.description ?? "").toString(),
+          duration: (m.duration ?? m.time ?? "").toString(),
+          xp: (m.xp ?? "").toString(),
+        };
+      }).filter(m => m.title);
+    } catch {}
+
+    const seen = new Set();
+    const dedupe = (arr) => arr.filter(m => {
+      const k = m.title.toLowerCase();
+      if (seen.has(k)) return false;
+      seen.add(k);
+      return true;
+    });
+
+    let next;
+    if (mode === "replace") next = dedupe(selectedObjects);
+    else next = dedupe([...current, ...selectedObjects]);
+
+    if (typeof window.customMissions === "object" && typeof window.saveCustomMissions === "function") {
+      window.customMissions[catId] = next;
+      window.saveCustomMissions();
+      window.renderCategories?.();
+      window.showMissions?.(catId);
+    } else {
+      const raw = localStorage.getItem("customMissions_v1") || "{}";
+      const obj = JSON.parse(raw);
+      obj[catId] = next;
+      localStorage.setItem("customMissions_v1", JSON.stringify(obj));
+      window.loadCustomMissions?.();
+      window.renderCategories?.();
+      window.showMissions?.(catId);
+    }
+  }
+
+  // ---------- PUBLIC OPEN (for console) ----------
+  function openNalAi(categoryId){
+    if (!categoryId) return;
+    aiState.categoryId = categoryId;
+    setHeader(categoryId);
+    openOverlay();
+    syncOptionsUI();
+    loadSuggestions(categoryId);
+  }
+  window.openNalAi = openNalAi;
+  window.__getLadderSlice = getLadderSlice;
+
+  // ---------- CLICK HANDLERS ----------
+  document.addEventListener("click", (e) => {
+    const btn = e.target.closest('button.nal-ai-open[data-category-id]');
+    if (!btn) return;
+    const categoryId = btn.dataset.categoryId || "body";
+    openNalAi(categoryId);
+  }, true);
+
+  document.addEventListener("click", (e) => {
+    const overlay = els.overlay();
+    if (!overlay || !overlay.classList.contains("nal-ai-open")) return;
+
+    if (e.target === overlay) { closeOverlay(); return; }
+    if (e.target === els.closeBtn() || e.target === els.cancelBtn()) { closeOverlay(); return; }
+  }, true);
+
+  window.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") closeOverlay();
+  }, true);
+
+  els.regenBtn()?.addEventListener("click", () => {
+    if (!aiState.categoryId || aiState.loading) return;
+    loadSuggestions(aiState.categoryId);
+  });
+
+  els.applyBtn()?.addEventListener("click", () => {
+    const btn = els.applyBtn();
+    if (!btn || btn.classList.contains("nal-ai-disabled")) return;
+    applySuggestionsToDashboard(aiState.categoryId);
+    closeOverlay();
+  });
+
+  els.modeSeg()?.addEventListener("click", (e) => {
+    const b = e.target.closest("button[data-mode]");
+    if (!b) return;
+
+    const seg = els.modeSeg();
+    seg.querySelectorAll("button[data-mode]").forEach(x => {
+      x.classList.toggle("nal-ai-active", x === b);
+      x.setAttribute("aria-selected", x === b ? "true" : "false");
+    });
+
+    aiState.aiMode = b.dataset.mode || "focused";
+    if (aiState.categoryId && !aiState.loading) loadSuggestions(aiState.categoryId);
+  });
+
+  // init
+  syncOptionsUI();
+
+
+
+</script>
+
+  
 <!-- ===== Auth FAB (bottom-right) ===== -->
 <div id="authFab" title="Account">
   <div class="auth-pill" id="authFabBtn">
@@ -3502,6 +4013,6 @@ btn.addEventListener("click", (e) => {
   });
 })();
 </script>
-<script src="./js/lad.js?v=3"></script>
+
 </body>
   </html>
